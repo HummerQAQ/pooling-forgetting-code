@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+import os
+from typing import List, Optional, Sequence, Tuple
+
+import pandas as pd
+
+
+def _import_statsforecast():
+    from statsforecast import StatsForecast
+    from statsforecast.models import (
+        CrostonClassic,
+        CrostonSBA,
+        TSB,
+        ADIDA,
+        IMAPA,
+        AutoARIMA,
+        AutoTheta,
+    )
+
+    return StatsForecast, {
+        "CrostonClassic": CrostonClassic,
+        "CrostonSBA": CrostonSBA,
+        "TSB": TSB,
+        "ADIDA": ADIDA,
+        "IMAPA": IMAPA,
+        "AutoARIMA": AutoARIMA,
+        "AutoTheta": AutoTheta,
+    }
+
+
+def _prepare_horizons(horizons: pd.Series) -> pd.DataFrame:
+    """Normalize horizon series into a two-column frame: [unique_id, h]."""
+    if horizons.empty:
+        return pd.DataFrame(columns=["unique_id", "h"])
+
+    h = horizons.astype(int)
+    h = h[h > 0]
+    if h.empty:
+        return pd.DataFrame(columns=["unique_id", "h"])
+
+    h_df = h.rename("h").reset_index()
+    uid_col = h_df.columns[0]
+    if uid_col != "unique_id":
+        h_df = h_df.rename(columns={uid_col: "unique_id"})
+    return h_df[["unique_id", "h"]]
+
+
+def _fit_predict_panel(
+    train_df: pd.DataFrame,
+    horizon_df: pd.DataFrame,
+    models: list,
+    freq: str,
+    probabilistic: bool,
+    levels: Optional[List[int]],
+    n_jobs: int = -1,
+) -> pd.DataFrame:
+    """Fit panel baselines once and trim per-series horizons.
+
+    ``n_jobs=1`` keeps the fit in-process: on Windows each ``n_jobs=-1`` call
+    spawns a fresh worker pool whose imports + numba JIT dominate wall time for
+    cheap models, so tuning loops that call this once per candidate should pass 1.
+    """
+    if horizon_df.empty:
+        return pd.DataFrame()
+
+    StatsForecast, _ = _import_statsforecast()
+    valid_uids = set(horizon_df["unique_id"].tolist())
+    train_panel = train_df.loc[train_df["unique_id"].isin(valid_uids), ["unique_id", "ds", "y"]]
+    if train_panel.empty:
+        return pd.DataFrame()
+
+    h_max = int(horizon_df["h"].max())
+    # ARS_SF_NJOBS overrides the worker count for protocols that call this in a
+    # loop (walk-forward, tuning): on Windows every n_jobs=-1 call pays a fresh
+    # pool spawn (imports + numba JIT), which dominates for cheap models.
+    n_jobs = int(os.environ.get("ARS_SF_NJOBS", n_jobs))
+    sf = StatsForecast(models=models, freq=freq, n_jobs=n_jobs)
+    sf.fit(df=train_panel)
+
+    if probabilistic:
+        try:
+            pred = sf.predict(h=h_max, level=levels or [80, 50])
+        except TypeError:
+            pred = sf.forecast(df=train_panel, h=h_max, level=levels or [80, 50])
+    else:
+        pred = sf.predict(h=h_max)
+
+    out = pred.reset_index()
+    out["h_step"] = out.groupby("unique_id").cumcount() + 1
+    out = out.merge(horizon_df, on="unique_id", how="inner")
+    out = out[out["h_step"] <= out["h"]].drop(columns=["h_step", "h"])
+    return out.reset_index(drop=True)
+
+
+def fit_predict_baselines(
+    train_df: pd.DataFrame,
+    horizons: pd.Series,
+    freq: str = "D",
+    tsb_grid: Optional[Sequence[Tuple[float, float]]] = None,
+    probabilistic: bool = False,
+    levels: Optional[List[int]] = None,
+    season_length: int = 7,
+) -> pd.DataFrame:
+    """Fit StatsForecast baselines on panel data and return predictions."""
+    _, M = _import_statsforecast()
+    horizon_df = _prepare_horizons(horizons)
+
+    if tsb_grid is not None:
+        outputs = []
+        for alpha_d, alpha_p in tsb_grid:
+            tmp = _fit_predict_panel(
+                train_df=train_df,
+                horizon_df=horizon_df,
+                models=[M["TSB"](alpha_d=alpha_d, alpha_p=alpha_p)],
+                freq=freq,
+                probabilistic=probabilistic,
+                levels=levels,
+            )
+            if tmp.empty:
+                continue
+            tmp["alpha_d"] = alpha_d
+            tmp["alpha_p"] = alpha_p
+            outputs.append(tmp)
+        return pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
+
+    if probabilistic:
+        models = [
+            M["AutoARIMA"](season_length=int(max(season_length, 1))),
+            M["AutoTheta"](season_length=int(max(season_length, 1))),
+        ]
+    else:
+        models = [
+            M["CrostonClassic"](),
+            M["CrostonSBA"](),
+            M["TSB"](alpha_d=0.5, alpha_p=0.45),
+            M["ADIDA"](),
+            M["IMAPA"](),
+            M["AutoTheta"](),
+            M["AutoARIMA"](),
+        ]
+
+    return _fit_predict_panel(
+        train_df=train_df,
+        horizon_df=horizon_df,
+        models=models,
+        freq=freq,
+        probabilistic=probabilistic,
+        levels=levels,
+    )
+
+
+# Single-model keys for timing (point forecasting default set)
+POINT_BASELINE_KEYS = [
+    "CrostonClassic",
+    "CrostonSBA",
+    "TSB",
+    "ADIDA",
+    "IMAPA",
+    "AutoTheta",
+    "AutoARIMA",
+]
+
+
+def fit_predict_single_baseline(
+    train_df: pd.DataFrame,
+    horizons: pd.Series,
+    model_key: str,
+    freq: str = "D",
+) -> pd.DataFrame:
+    """Fit and predict a single StatsForecast model. Used for per-model timing."""
+    _, M = _import_statsforecast()
+    if model_key not in M:
+        return pd.DataFrame()
+    horizon_df = _prepare_horizons(horizons)
+    if model_key == "TSB":
+        model = M["TSB"](alpha_d=0.5, alpha_p=0.45)
+    elif model_key == "AutoARIMA":
+        model = M["AutoARIMA"]()
+    elif model_key == "AutoTheta":
+        model = M["AutoTheta"]()
+    else:
+        model = M[model_key]()
+    return _fit_predict_panel(
+        train_df=train_df,
+        horizon_df=horizon_df,
+        models=[model],
+        freq=freq,
+        probabilistic=False,
+        levels=None,
+    )
