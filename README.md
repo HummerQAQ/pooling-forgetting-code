@@ -1,7 +1,6 @@
 # Supplementary code
 
-Anonymized code for the submission "When Does Pooling Pay? Credibility and Resolution under
-Forgetting in Intermittent-Demand Forecasting".
+Anonymized code and result files accompanying a conference submission under review.
 
 Naming: the method is called EBB in the paper. In the code, `eb_hurdle` (label `EB-Hurdle`) is the
 hierarchical empirical-Bayes hurdle model, and `EBB` / `ebb` denotes that model with the selected
